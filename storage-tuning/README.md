@@ -8,12 +8,12 @@ Azure Blob (257 GB image, 1 MiB blocks, on-demand)
        read cache: /mnt/storage-driver-tmp/fuse-read.cache-*  (sparse, local temp disk)
        writes:     /mnt/data/fuse-writes.img                    (sparse, local data disk)
      └─ /dev/loop3 → ext4 /mnt/cloudenvdata
-          └─ dockerlib (32 GB file, 23 GB allocated, only ~1.9 GB referenced)
+          └─ dockerlib (32 GB file, ~26 GB allocated, only ~1.9 GB referenced)
              └─ /dev/loop4 → ext4 /var/lib/docker  (+ bind mount /home/ubuntu)
 ```
 
 Every first-touch read walks that whole chain and ends in a network fetch. The driver's own
-background prefetch has a 10 s budget and spends it on the ~23 GB of stale blocks in `dockerlib`,
+background prefetch has a 10 s budget and spends it on the ~24 GB of stale blocks in `dockerlib`,
 so it only ever fetched ~1.7 GB of mostly useless data.
 
 ## What was slow, and why
@@ -40,7 +40,7 @@ request was issued and waited on serially. Raising readahead on the FUSE file an
   (the write path drains at ~50 MB/s; the default 20 % of RAM ≈ 1.6 GB of dirty data would stall
   fsync/sync for 30 s+).
 
-## Warm-up (`warm-docker-root.sh [readers]`)
+## Warm-up (`warm-docker-root.py [readers]`)
 
 Parses `dumpe2fs /dev/loop4`, computes the *allocated* block ranges of the inner ext4 (~1.9 GB),
 and reads them through `/dev/loop4` with O_DIRECT in 1 MiB chunks. This pulls exactly the working
@@ -61,16 +61,15 @@ inode-table space that the driver answers from its zero-block manifest without n
 
 ## Persistence
 
-- Host: `codespace-storage-tuning.service` (enabled, runs both scripts after docker) and
-  `/etc/udev/rules.d/99-codespace-loop-tuning.rules` (re-applies tunables whenever a loop device
-  is (re)attached). The host VM is ephemeral across codespace stop/start, so these vanish then.
+- Nothing on the host survives a codespace stop/start (the host VM is ephemeral), so the
+  tunables are back at defaults after every restart. Re-run both scripts as root on the host.
 - This directory lives inside `disk.img` and does persist. To re-apply automatically on every
   codespace start, add a `postStartCommand` to the devcontainer that uses the host docker socket
   (mounted at `/var/run/docker-host.sock`) to run the scripts on the host, e.g.
 
   ```
   docker -H unix:///var/run/docker-host.sock run --rm --privileged -v /:/host ubuntu \
-    chroot /host bash -c '/home/ubuntu/claude/storage-tuning/apply-tunables.sh && /home/ubuntu/claude/storage-tuning/warm-docker-root.sh 2'
+    chroot /host bash -c '/home/ubuntu/claude/storage-tuning/apply-tunables.sh && /home/ubuntu/claude/storage-tuning/warm-docker-root.py 2'
   ```
 
 ## Analysis helpers

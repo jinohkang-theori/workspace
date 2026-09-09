@@ -41,7 +41,7 @@ import subprocess
 import sys
 import traceback
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Union
 
 TAG = "[apply-tunables]"
 SYS = "/sys"
@@ -291,17 +291,20 @@ def block_device(majmin: str) -> Optional[BlockDev]:
 @dataclass
 class Node:
     depth: int
-    mount: Optional[Mount] = None
-    blk: Optional[BlockDev] = None
+    # A filesystem mount, a block device, or a description of something that
+    # could not be resolved to either (e.g. "path /x", "block device 7:9").
+    layer: Union[Mount, BlockDev, str]
     terminal_reason: Optional[str] = None   # set when the walk stopped here
 
     def describe(self) -> str:
         pad = "  " * self.depth
-        if self.mount is not None:
-            m = self.mount
+        if isinstance(self.layer, Mount):
+            m = self.layer
             s = f"{pad}fs {m.fstype} {m.majmin} {m.target} (source={m.source}, opts={','.join(sorted(m.options))})"
+        elif isinstance(self.layer, BlockDev):
+            s = f"{pad}blk {self.layer}"
         else:
-            s = f"{pad}blk {self.blk}"
+            s = f"{pad}?? {self.layer}"
         if self.terminal_reason:
             s += f"  <- STOP: {self.terminal_reason}"
         return s
@@ -320,15 +323,14 @@ class Walker:
     def walk_path(self, path: str, depth: int = 0) -> None:
         m = mount_for_path(path, self.mounts)
         if m is None:
-            n = Node(depth, terminal_reason=f"no mount found for {path}")
-            self.nodes.append(n)
+            self.nodes.append(Node(depth, f"path {path}", terminal_reason="no mount found"))
             self.unknown_found = True
             log(f"could not find a mount for {path}")
             return
         self.walk_mount(m, depth)
 
     def walk_mount(self, m: Mount, depth: int) -> None:
-        node = Node(depth, mount=m)
+        node = Node(depth, m)
         self.nodes.append(node)
         if m.majmin in self.seen_mounts:
             node.terminal_reason = "already visited"
@@ -370,20 +372,17 @@ class Walker:
         return None
 
     def walk_block(self, majmin: str, depth: int) -> None:
-        node = Node(depth)
+        b = block_device(majmin)
+        if b is None:
+            self.nodes.append(Node(depth, f"block device {majmin}", terminal_reason="no sysfs entry"))
+            self.unknown_found = True
+            return
+        node = Node(depth, b)
         self.nodes.append(node)
         if majmin in self.seen_blk:
-            node.blk = block_device(majmin) or BlockDev(majmin, "?", "", "unknown")
             node.terminal_reason = "already visited"
             return
         self.seen_blk.add(majmin)
-        b = block_device(majmin)
-        if b is None:
-            node.blk = BlockDev(majmin, "?", "", "unknown")
-            node.terminal_reason = "no sysfs entry for this device"
-            self.unknown_found = True
-            return
-        node.blk = b
 
         if b.kind == "loop":
             if not b.backing_file:
@@ -504,8 +503,8 @@ def apply(walker: Walker, cfg: Dict[str, int], assume_remote: bool) -> None:
     done_mounts: Set[str] = set()
     done_blk: Set[str] = set()
     for n in walker.nodes:
-        if n.mount is not None:
-            m = n.mount
+        if isinstance(n.layer, Mount):
+            m = n.layer
             if m.majmin in done_mounts:
                 continue
             done_mounts.add(m.majmin)
@@ -516,8 +515,8 @@ def apply(walker: Walker, cfg: Dict[str, int], assume_remote: bool) -> None:
                 # through is remounted, other bind mounts of the device are left alone.
                 remount_noatime(m)
             # anonymous/unknown filesystems: nothing to do
-        elif n.blk is not None:
-            b = n.blk
+        elif isinstance(n.layer, BlockDev):
+            b = n.layer
             if b.majmin in done_blk or n.terminal_reason == "already visited":
                 continue
             done_blk.add(b.majmin)

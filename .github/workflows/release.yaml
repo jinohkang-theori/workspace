@@ -1,0 +1,24 @@
+# Publishes the Feature(s) under .devcontainer/src to
+# ghcr.io/<owner>/<repo>/<feature-id>. Manual trigger: bump "version" in
+# devcontainer-feature.json first, then run this workflow.
+name: "Release Features"
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish Features
+        uses: devcontainers/action@v1
+        with:
+          publish-features: "true"
+          base-path-to-features: "./.devcontainer/src"
+          generate-docs: "false"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

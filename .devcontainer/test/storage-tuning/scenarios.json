@@ -1,0 +1,14 @@
+{
+    "custom_options": {
+        "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+        "features": {
+            "storage-tuning": {
+                "dockerSocket": "/var/run/docker-host.sock",
+                "helperImage": "docker.io/library/busybox:stable",
+                "warmReaders": "4",
+                "timeoutSeconds": "0",
+                "verbose": true
+            }
+        }
+    }
+}

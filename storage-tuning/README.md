@@ -31,13 +31,17 @@ request was issued and waited on serially. Raising readahead on the FUSE file an
 
 ## What is applied (`apply-tunables.py`, idempotent, run as root)
 
+The script lives in the dev container Feature at
+[`.devcontainer/src/storage-tuning/apply-tunables.py`](../.devcontainer/src/storage-tuning/apply-tunables.py);
+this directory keeps the analysis notes, data and helpers.
+
 The script does not assume loop3/loop4/csfs. It walks the stack from the docker
 data-root (`/etc/docker/daemon.json` `data-root`, else `/var/lib/docker`):
 mount -> block device -> loop backing file -> its mount -> ... following loop devices,
 device-mapper/md slaves and partitions, until it reaches a FUSE/network filesystem
 (remote leaf), a local disk, or something it does not recognise. It then tunes each
 layer by role rather than by name. `--dry-run` prints the detected stack and the planned
-writes; `apply-tunables.sh` is a shim that execs the Python script.
+writes.
 
 Roles, using the current stack as the example:
 
@@ -95,14 +99,15 @@ codespace does not blow up memory. `--dry-run` reports the chunk count without r
 - Nothing on the host survives a codespace stop/start (the host VM is ephemeral), so the
   tunables are back at defaults after every restart. Re-run `apply-tunables.py --warm` as
   root on the host.
-- This directory lives inside `disk.img` and does persist. To re-apply automatically on every
-  codespace start, add a `postStartCommand` to the devcontainer that uses the host docker socket
-  (mounted at `/var/run/docker-host.sock`) to run the scripts on the host, e.g.
-
-  ```
-  docker -H unix:///var/run/docker-host.sock run --rm --privileged -v /:/host ubuntu \
-    chroot /host /home/ubuntu/claude/storage-tuning/apply-tunables.py --warm
-  ```
+- The repository lives inside `disk.img` and does persist, so the re-apply is done from the dev
+  container: the [`storage-tuning` Feature](../.devcontainer/src/storage-tuning/README.md) installs
+  the script and a wrapper wired to `postStartCommand`. Because it reaches the VM host, it is inert
+  until the Codespaces user secrets `ENABLE_STORAGE_TUNING` and/or `ENABLE_STORAGE_PREWARM` are set.
+  The wrapper does not `chroot /host` (that keeps the container's mount and user namespaces, which
+  the remounts, `/proc/sys/vm` writes and FUSE connection files depend on); it starts a privileged
+  `--pid=host --userns=host` helper through the host docker socket and `nsenter`s PID 1's
+  namespaces, then streams the script to the host's `python3`. `shell.sh` in the repository root
+  does the same for an interactive host shell.
 
 ## Analysis helpers
 

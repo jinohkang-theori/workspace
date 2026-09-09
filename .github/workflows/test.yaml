@@ -1,0 +1,42 @@
+name: "Test Features"
+on:
+  push:
+    branches: [main]
+    paths: [".devcontainer/**", ".github/workflows/test.yaml"]
+  pull_request:
+    paths: [".devcontainer/**", ".github/workflows/test.yaml"]
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -s sh .devcontainer/src/storage-tuning/install.sh .devcontainer/src/storage-tuning/storage-tuning.sh
+          shellcheck -s bash .devcontainer/test/storage-tuning/*.sh
+      - name: python and json
+        run: |
+          python3 -m py_compile .devcontainer/src/storage-tuning/apply-tunables.py
+          python3 -m json.tool .devcontainer/src/storage-tuning/devcontainer-feature.json >/dev/null
+          python3 -m json.tool .devcontainer/test/storage-tuning/scenarios.json >/dev/null
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        base-image:
+          - mcr.microsoft.com/devcontainers/base:ubuntu
+          - mcr.microsoft.com/devcontainers/base:debian
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install devcontainer CLI
+        run: npm install -g @devcontainers/cli
+      - name: Test storage-tuning
+        run: |
+          devcontainer features test \
+            --project-folder .devcontainer \
+            --features storage-tuning \
+            --base-image ${{ matrix.base-image }}

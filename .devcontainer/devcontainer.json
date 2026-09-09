@@ -5,17 +5,25 @@
 	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
 	"image": "mcr.microsoft.com/devcontainers/base:ubuntu24.04",
 
-	"mounts": [
-		{
-			"source": "/", // TODO: Why doesn't this work?
-			"target": "/host",
-			"type": "bind"
-		}
-	],
-
 	// Features to add to the dev container. More info: https://containers.dev/features.
 	"features": {
-		"ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+		"ghcr.io/devcontainers/features/docker-outside-of-docker:1": {},
+		// Host storage tuning (local copy of the Feature in ./src/storage-tuning; published
+		// as ghcr.io/jinohkang-theori/workspace/storage-tuning by .github/workflows/release.yaml).
+		// It runs on the Codespaces VM host at every start, so it stays inert until the
+		// secrets below are set.
+		"./src/storage-tuning": {}
+	},
+
+	// Codespaces user secrets the storage-tuning Feature is gated behind. Listing them here
+	// only makes Codespaces prompt for them; any non-empty value other than 0/false/no/off enables.
+	"secrets": {
+		"ENABLE_STORAGE_TUNING": {
+			"description": "Set to 1 to tune the Codespaces VM host storage stack (readahead, FUSE queue depth, noatime, dirty-page limits) at every start."
+		},
+		"ENABLE_STORAGE_PREWARM": {
+			"description": "Set to 1 to prefetch the docker root's allocated blocks into the host's local read cache at every start."
+		}
 	}
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
 	// "forwardPorts": [],

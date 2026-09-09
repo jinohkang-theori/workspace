@@ -209,7 +209,23 @@ class BlockDev:
     backing_file: Optional[str] = None
     slaves: List[str] = field(default_factory=list)   # majmin of lower devices
     parent: Optional[str] = None    # majmin of the whole disk for a partition
-    detail: str = ""
+    stack_type: Optional[str] = None  # "dm", "md" or "?" for stacked devices
+    dm_name: Optional[str] = None
+
+    def __str__(self) -> str:
+        s = f"{self.kind} {self.majmin} /dev/{self.name}"
+        if self.kind == "loop":
+            s += f" backing_file={self.backing_file}"
+        elif self.kind == "stacked":
+            s += f" {self.stack_type}"
+            if self.dm_name:
+                s += f" name={self.dm_name}"
+            s += f" slaves={self.slaves}"
+        elif self.kind == "partition":
+            s += f" parent={self.parent}"
+        elif self.kind == "unknown":
+            s += " (no loop/slaves/partition attributes and unrecognised name)"
+        return s
 
     @property
     def is_virtual(self) -> bool:
@@ -248,28 +264,24 @@ def block_device(majmin: str) -> Optional[BlockDev]:
     if os.path.isdir(loop_dir):
         dev.kind = "loop"
         dev.backing_file = _read(os.path.join(loop_dir, "backing_file"))
-        dev.detail = f"backing_file={dev.backing_file}"
     elif slaves:
         dev.kind = "stacked"
         for s in slaves:
             mm = _majmin_of_sysdir(os.path.join(slaves_dir, s))
             if mm:
                 dev.slaves.append(mm)
-        sub = "dm" if os.path.isdir(os.path.join(syspath, "dm")) else \
-              "md" if os.path.isdir(os.path.join(syspath, "md")) else "?"
-        dm_name = _read(os.path.join(syspath, "dm", "name"))
-        dev.detail = f"{sub}{' name=' + dm_name if dm_name else ''} slaves={slaves}"
+        dev.stack_type = "dm" if os.path.isdir(os.path.join(syspath, "dm")) else \
+                         "md" if os.path.isdir(os.path.join(syspath, "md")) else "?"
+        dev.dm_name = _read(os.path.join(syspath, "dm", "name"))
     elif os.path.exists(os.path.join(syspath, "partition")):
         dev.kind = "partition"
         dev.parent = _majmin_of_sysdir(os.path.dirname(syspath))
-        dev.detail = f"parent={dev.parent}"
     elif name.startswith(REMOTE_BLOCK_PREFIXES):
         dev.kind = "disk-remote"
     elif name.startswith(LOCAL_DISK_PREFIXES):
         dev.kind = "disk-local"
     else:
         dev.kind = "unknown"
-        dev.detail = "no loop/slaves/partition attributes and unrecognised name"
     return dev
 
 
@@ -289,8 +301,7 @@ class Node:
             m = self.mount
             s = f"{pad}fs {m.fstype} {m.majmin} {m.target} (source={m.source}, opts={','.join(sorted(m.options))})"
         else:
-            b = self.blk
-            s = f"{pad}blk {b.kind} {b.majmin} /dev/{b.name}" + (f" {b.detail}" if b.detail else "")
+            s = f"{pad}blk {self.blk}"
         if self.terminal_reason:
             s += f"  <- STOP: {self.terminal_reason}"
         return s

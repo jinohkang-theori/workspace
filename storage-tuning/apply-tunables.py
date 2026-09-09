@@ -41,7 +41,7 @@ import subprocess
 import sys
 import traceback
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 TAG = "[apply-tunables]"
 SYS = "/sys"

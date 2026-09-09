@@ -11,5 +11,5 @@ exec sudo docker -H unix:///var/run/docker-host.sock \
     run --rm -it --name="guest2host-$$" --privileged \
     --pid=host --userns=host --uts=host \
     --ipc=host --cgroupns=host --network=host \
-    -v /:/host mcr.microsoft.com/devcontainers/base:resolute \
+    -v /:/host mcr.microsoft.com/devcontainers/base:ubuntu24.04 \
     nsenter -FZ -t1 -a env TERM="$TERM" sh -ec "$cmd" - "$@"

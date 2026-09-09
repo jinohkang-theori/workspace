@@ -60,14 +60,25 @@ Failure policy: this runs in the devcontainer critical path, so it always exits 
 `STOP:` marker; everything recognised above them is still tuned. None of the knobs can corrupt
 data, so nothing is worth aborting the pipeline for.
 
-## Warm-up (`warm-docker-root.sh [readers]`)
+## Warm-up (`apply-tunables.py --warm [--readers N]`, or `--warm-only` to skip the tuning)
 
-Parses `dumpe2fs /dev/loop4`, computes the *allocated* block ranges of the inner ext4 (~1.9 GB),
-and reads them through `/dev/loop4` with O_DIRECT in 1 MiB chunks. This pulls exactly the working
-set into the driver's local cache and skips the ~21 GB of stale blocks. Measured: 12 s on first
-run (network), 6–9 s afterwards (local). After it, everything under `/var/lib/docker` and
-`/home/ubuntu` is a local-cache hit; the only "remote" blocks left are zero-filled journal and
-inode-table space that the driver answers from its zero-block manifest without network.
+Uses the same stack walk to find the block device directly under the target filesystem
+(`/dev/loop4` today), streams `dumpe2fs` of that device to compute the *allocated* block ranges
+of the inner ext4 (~2 GB), and reads them through the device with O_DIRECT in `WARM_CHUNK_KB`
+(default 1 MiB, the driver's block size) chunks over `WARM_READERS` (default 2) parallel readers.
+This pulls exactly the working set into the driver's local cache and skips the ~21 GB of stale
+blocks. Outer ext filesystems on the way down (`/mnt/cloudenvdata`) only get their metadata
+touched (a discarded `dumpe2fs` run), since their allocated data *is* the stale bulk. Measured:
+12–19 s on first run (network), 6–9 s afterwards (local). After it, everything under
+`/var/lib/docker` and `/home/ubuntu` is a local-cache hit; the only "remote" blocks left are
+zero-filled journal and inode-table space that the driver answers from its zero-block manifest
+without network.
+
+Limits: only ext2/3/4 targets are warmed (other filesystems are logged and skipped); the warm-up
+is skipped entirely when no remote layer was detected (`ASSUME_REMOTE=1` overrides), because
+there is no local cache to fill. `dumpe2fs` output is consumed line by line and folded into a
+1-bit-per-chunk bitmap (4 KiB per 32 GiB), so a large, fragmented filesystem on a small-RAM
+codespace does not blow up memory. `--dry-run` reports the chunk count without reading anything.
 
 ## Things measured and rejected
 
@@ -82,14 +93,15 @@ inode-table space that the driver answers from its zero-block manifest without n
 ## Persistence
 
 - Nothing on the host survives a codespace stop/start (the host VM is ephemeral), so the
-  tunables are back at defaults after every restart. Re-run both scripts as root on the host.
+  tunables are back at defaults after every restart. Re-run `apply-tunables.py --warm` as
+  root on the host.
 - This directory lives inside `disk.img` and does persist. To re-apply automatically on every
   codespace start, add a `postStartCommand` to the devcontainer that uses the host docker socket
   (mounted at `/var/run/docker-host.sock`) to run the scripts on the host, e.g.
 
   ```
   docker -H unix:///var/run/docker-host.sock run --rm --privileged -v /:/host ubuntu \
-    chroot /host bash -c '/home/ubuntu/claude/storage-tuning/apply-tunables.py; /home/ubuntu/claude/storage-tuning/warm-docker-root.sh 2'
+    chroot /host /home/ubuntu/claude/storage-tuning/apply-tunables.py --warm
   ```
 
 ## Analysis helpers

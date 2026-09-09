@@ -19,7 +19,16 @@ touched here (readahead, FUSE queue depth, noatime, dirty-page limits) can
 corrupt data, so there is no situation in which aborting is safer than
 continuing.
 
-Usage: apply-tunables.py [--target PATH]... [--dry-run] [--strict] [--verbose]
+With --warm it additionally prefetches the target filesystem's *allocated* blocks
+(read from the block device directly under it, O_DIRECT, in 1 MiB chunks) so that the
+remote layer's local read cache holds the whole working set instead of whatever the
+driver's own background prefetch happened to pick. Only ext2/3/4 targets are supported
+(dumpe2fs supplies the block bitmaps; its output is streamed, never held in memory);
+the warm-up is skipped when no remote layer is present, since there is nothing to pull
+into a local cache.
+
+Usage: apply-tunables.py [--target PATH]... [--warm | --warm-only] [--readers N]
+                         [--dry-run] [--strict] [--verbose]
 Environment overrides (KiB unless noted):
   INNER_RA  (alias LOOP4_RA, default 128)  readahead of the device directly under
                                             the docker root; larger measured slower
@@ -31,17 +40,24 @@ Environment overrides (KiB unless noted):
   REMOTE_RA (alias FUSE_RA,  default 4096) readahead on FUSE / network filesystems.
   FUSE_MAX_BACKGROUND (64), FUSE_CONGESTION_THRESHOLD (48)
   VM_DIRTY_BACKGROUND_BYTES (128 MiB), VM_DIRTY_BYTES (512 MiB), VM_VFS_CACHE_PRESSURE (50)
+  WARM_READERS (2)        parallel O_DIRECT readers for --warm (also --readers).
+  WARM_CHUNK_KB (1024)    read granularity for --warm; match the remote layer's block size.
   ASSUME_REMOTE=1  treat the stack as network-backed even if no remote layer was
-                   recognised (enables MID_RA and the vm.* limits).
+                   recognised (enables MID_RA, the vm.* limits and --warm).
 """
 import argparse
 import json
+import mmap
 import os
 import subprocess
 import sys
+import tempfile
+import time
 import traceback
+from array import array
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Union
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 TAG = "[apply-tunables]"
 SYS = "/sys"
@@ -58,6 +74,8 @@ REMOTE_FS_TYPES = {
 BLOCK_FS_TYPES = {
     "ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "jfs", "reiserfs", "vfat", "exfat", "ntfs3",
 }
+# Block filesystems whose allocation bitmaps dumpe2fs can print (used by --warm).
+EXT_FS_TYPES = {"ext2", "ext3", "ext4"}
 # Anonymous local filesystems: nothing to tune, not remote.
 LOCAL_ANON_FS_TYPES = {"tmpfs", "ramfs", "overlay", "zfs", "bcachefs"}
 
@@ -236,6 +254,19 @@ class BlockDev:
         p = os.path.join(self.syspath, "queue")
         return p if os.path.isdir(p) else None
 
+    @property
+    def devnode(self) -> Optional[str]:
+        """Device node to open for I/O, or None if udev has not created one."""
+        for p in (f"/dev/{self.name}", f"/dev/block/{self.majmin}"):
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if os.path.exists(f"{SYS}/dev/block/{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}") \
+                    and f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}" == self.majmin:
+                return p
+        return None
+
 
 def _read(path: str) -> Optional[str]:
     try:
@@ -318,7 +349,18 @@ class Walker:
         self.seen_blk: Set[str] = set()
         self.remote_found = False
         self.unknown_found = False
-        self.inner_blk: Optional[str] = None  # majmin of the device directly under the target fs
+        self.targets: List[Mount] = []        # the filesystems the walk started from (depth 0)
+        self.fs_dev: Dict[str, str] = {}      # mount majmin -> majmin of the block device it sits on
+
+    @property
+    def inner_blks(self) -> Set[str]:
+        """Block devices directly under a target filesystem."""
+        return {self.fs_dev[m.majmin] for m in self.targets if m.majmin in self.fs_dev}
+
+    def walked_mounts(self) -> List[Mount]:
+        """Every filesystem the walk passed through, outermost target first, each once."""
+        return [n.layer for n in self.nodes
+                if isinstance(n.layer, Mount) and n.terminal_reason != "already visited"]
 
     def walk_path(self, path: str, depth: int = 0) -> None:
         m = mount_for_path(path, self.mounts)
@@ -336,6 +378,8 @@ class Walker:
             node.terminal_reason = "already visited"
             return
         self.seen_mounts.add(m.majmin)
+        if depth == 0:
+            self.targets.append(m)
 
         if m.is_remote:
             self.remote_found = True
@@ -353,8 +397,7 @@ class Walker:
                 node.terminal_reason = f"unrecognised filesystem type {m.fstype!r}"
             self.unknown_found = True
             return
-        if depth == 0 and self.inner_blk is None:
-            self.inner_blk = blk_mm
+        self.fs_dev[m.majmin] = blk_mm
         self.walk_block(blk_mm, depth + 1)
 
     def _block_dev_of_mount(self, m: Mount) -> Optional[str]:
@@ -490,16 +533,20 @@ def remount_noatime(m: Mount) -> None:
         log(f"remounted {m.target} noatime")
 
 
-def apply(walker: Walker, cfg: Dict[str, int], assume_remote: bool) -> None:
-    remote = walker.remote_found or assume_remote
+def decide_remote(walker: Walker, assume_remote: bool) -> bool:
+    """Is the stack network-backed? Gates MID_RA, the vm.* limits and the warm-up."""
     if walker.remote_found:
-        log("remote layer detected: enabling intermediate readahead and vm dirty limits")
+        log("remote layer detected: enabling intermediate readahead, vm dirty limits and warm-up")
     elif assume_remote:
-        log("ASSUME_REMOTE set: enabling intermediate readahead and vm dirty limits")
+        log("ASSUME_REMOTE set: enabling intermediate readahead, vm dirty limits and warm-up")
     else:
         log("no remote layer recognised" + (" (unknown layers present)" if walker.unknown_found else "")
-            + ": leaving intermediate readahead and vm.* at defaults; set ASSUME_REMOTE=1 to override")
+            + ": leaving intermediate readahead and vm.* at defaults, not warming; set ASSUME_REMOTE=1 to override")
+    return walker.remote_found or assume_remote
 
+
+def apply(walker: Walker, cfg: Dict[str, int], remote: bool) -> None:
+    inner_blks = walker.inner_blks
     done_mounts: Set[str] = set()
     done_blk: Set[str] = set()
     for n in walker.nodes:
@@ -520,7 +567,7 @@ def apply(walker: Walker, cfg: Dict[str, int], assume_remote: bool) -> None:
             if b.majmin in done_blk or n.terminal_reason == "already visited":
                 continue
             done_blk.add(b.majmin)
-            if b.majmin == walker.inner_blk:
+            if b.majmin in inner_blks:
                 if b.is_virtual:
                     set_readahead(b, cfg["INNER_RA"], f"readahead inner /dev/{b.name}")
                 else:
@@ -545,6 +592,224 @@ def apply(walker: Walker, cfg: Dict[str, int], assume_remote: bool) -> None:
 
 
 # ----------------------------------------------------------------------------
+# warm-up: pull the target filesystem's allocated blocks through the stack
+# ----------------------------------------------------------------------------
+class ExtAllocation:
+    """Streams dumpe2fs output into a bitmap of chunks that hold allocated blocks.
+
+    dumpe2fs lists the *free* ranges of every block group, in ascending order;
+    everything between them is allocated (data, inode tables, bitmaps, journal).
+    The output can be huge on a fragmented filesystem, so it is consumed line by
+    line and only a chunk-granularity bitmap is kept (1 bit per WARM_CHUNK_KB, i.e.
+    4 KiB per 32 GiB at the default 1 MiB chunk). A free range that arrives out of
+    order is not trusted; the space stays marked allocated, which only over-reads.
+    """
+
+    def __init__(self, chunk: int):
+        self.chunk = chunk
+        self.block_size = 0
+        self.block_count = 0
+        self.free_blocks = 0
+        self.out_of_order = 0
+        self._cur = 0                   # first block not yet classified
+        self._bits = bytearray()
+        self._in_groups = False
+
+    @property
+    def used_blocks(self) -> int:
+        return self.block_count - self.free_blocks
+
+    def feed(self, line: str) -> None:
+        if not self._in_groups:
+            # superblock header: "Block count:" / "Block size:" (in that order), then "Group 0:"
+            if line.startswith("Block count:"):
+                self.block_count = int(line.split(":", 1)[1])
+            elif line.startswith("Block size:"):
+                self.block_size = int(line.split(":", 1)[1])
+            elif line.startswith("Group "):
+                if not (self.block_size and self.block_count):
+                    raise ValueError("dumpe2fs output lacks 'Block size:' / 'Block count:' before the group list")
+                nchunks = -(-(self.block_count * self.block_size) // self.chunk)
+                self._bits = bytearray(-(-nchunks // 8))
+                self._in_groups = True
+            return
+        if not line.startswith((" ", "\t")):
+            return                      # "Group N:" header line
+        stripped = line.lstrip()
+        if not stripped.startswith("Free blocks:"):
+            return                      # other per-group attribute
+        for part in stripped[len("Free blocks:"):].split(","):
+            part = part.strip()
+            if not part:
+                continue
+            a, _, b = part.partition("-")
+            lo, hi = int(a), int(b or a) + 1
+            self.free_blocks += hi - lo
+            if lo < self._cur:
+                self.out_of_order += 1
+                lo = self._cur
+                if hi <= lo:
+                    continue
+            self._mark_used(self._cur, lo)
+            self._cur = hi
+
+    def finish(self) -> None:
+        if not self._in_groups:
+            raise ValueError("dumpe2fs output has no block group list")
+        self._mark_used(self._cur, self.block_count)
+        self._cur = self.block_count
+
+    def _mark_used(self, lo_block: int, hi_block: int) -> None:
+        if hi_block <= lo_block:
+            return
+        lo = (lo_block * self.block_size) // self.chunk
+        hi = (hi_block * self.block_size - 1) // self.chunk + 1   # exclusive
+        bits = self._bits
+        while lo < hi and lo % 8:
+            bits[lo >> 3] |= 1 << (lo & 7)
+            lo += 1
+        if hi - lo >= 8:
+            full = (hi - lo) // 8
+            bits[lo >> 3:(lo >> 3) + full] = b"\xff" * full
+            lo += full * 8
+        while lo < hi:
+            bits[lo >> 3] |= 1 << (lo & 7)
+            lo += 1
+
+    def offsets(self) -> array:
+        """Byte offsets of every chunk holding allocated blocks, ascending."""
+        out = array("q")
+        chunk = self.chunk
+        for i, byte in enumerate(self._bits):
+            if byte:
+                base = i * 8
+                out.extend((base + j) * chunk for j in range(8) if byte >> j & 1)
+        return out
+
+
+def run_dumpe2fs(devnode: str, on_line: Optional[Callable[[str], None]] = None) -> bool:
+    """Run dumpe2fs on devnode, streaming stdout to on_line (or discarding it when
+    only the metadata read itself is wanted). Returns True on success."""
+    with tempfile.TemporaryFile("w+") as err:
+        try:
+            proc = subprocess.Popen(["dumpe2fs", devnode],
+                                    stdout=subprocess.PIPE if on_line else subprocess.DEVNULL,
+                                    stderr=err, text=True, errors="replace")
+        except FileNotFoundError:
+            log("skip warm-up: dumpe2fs not installed (e2fsprogs)")
+            return False
+        except OSError as e:
+            fail(f"warm-up: dumpe2fs {devnode}: {e.strerror}")
+            return False
+        try:
+            if on_line and proc.stdout:
+                for line in proc.stdout:
+                    on_line(line.rstrip("\n"))
+        except ValueError as e:
+            proc.kill()
+            fail(f"warm-up: parsing dumpe2fs {devnode}: {e}")
+            return False
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+            rc = proc.wait()
+        if rc != 0:
+            err.seek(0)
+            lines = err.read().strip().splitlines()
+            fail(f"warm-up: dumpe2fs {devnode} exited {rc}: {lines[-1] if lines else ''}")
+            return False
+    return True
+
+
+def read_chunks(devnode: str, offsets: array, chunk: int, readers: int) -> int:
+    """O_DIRECT-read every chunk; returns bytes read. Each reader gets a contiguous
+    slice so it stays sequential (readahead-friendly) on the layers below."""
+    def worker(sub: array) -> Tuple[int, List[str]]:
+        n, errors = 0, []
+        try:
+            fd = os.open(devnode, os.O_RDONLY | os.O_DIRECT)
+        except OSError as e:
+            return 0, [f"open {devnode}: {e.strerror}"]
+        try:
+            buf = mmap.mmap(-1, chunk)      # page aligned, as O_DIRECT requires
+            try:
+                for off in sub:
+                    try:
+                        n += os.preadv(fd, [buf], off)
+                    except OSError as e:
+                        errors.append(f"read {devnode} @ {off}: {e.strerror}")
+            finally:
+                buf.close()
+        finally:
+            os.close(fd)
+        return n, errors
+
+    readers = max(1, min(readers, len(offsets)))
+    per = -(-len(offsets) // readers)
+    with ThreadPoolExecutor(readers) as ex:
+        results = list(ex.map(worker, [offsets[i:i + per] for i in range(0, len(offsets), per)]))
+    total = sum(n for n, _ in results)
+    errors = [e for _, errs in results for e in errs]
+    for e in errors[:5]:
+        fail(f"warm-up: {e}")
+    if len(errors) > 5:
+        fail(f"warm-up: {len(errors) - 5} more read errors not shown")
+    return total
+
+
+def warm(walker: Walker, cfg: Dict[str, int], remote: bool, readers: int) -> None:
+    if not remote:
+        log("skip warm-up: stack not known to be remote, nothing to pull into a local cache")
+        return
+    chunk = cfg["WARM_CHUNK_KB"] * 1024
+    MiB = 1 << 20
+    for m in walker.walked_mounts():
+        is_target = m in walker.targets
+        dev_mm = walker.fs_dev.get(m.majmin)
+        if m.fstype not in EXT_FS_TYPES or dev_mm is None:
+            if is_target:
+                log(f"skip warm-up of {m.target}: only ext2/3/4 on a block device is supported (found {m.fstype})")
+            continue
+        b = block_device(dev_mm)
+        node = b.devnode if b else None
+        if node is None:
+            log(f"skip warm-up of {m.target}: no device node for {dev_mm}")
+            continue
+        if not os.access(node, os.R_OK):
+            log(f"skip warm-up of {m.target}: {node} not readable")
+            continue
+
+        # dumpe2fs reads the superblock, group descriptors and bitmaps, i.e. exactly the
+        # metadata worth having local on every layer; for non-target layers that is all
+        # we want (their allocated *data* is the stale bulk we are trying to avoid).
+        if not is_target:
+            if run_dumpe2fs(node):
+                dbg(f"warm-up: touched metadata of {m.fstype} {m.target} on {node}")
+            continue
+        alloc = ExtAllocation(chunk)
+        if not run_dumpe2fs(node, alloc.feed):
+            continue
+        try:
+            alloc.finish()
+        except ValueError as e:
+            fail(f"warm-up: parsing dumpe2fs {node}: {e}")
+            continue
+        if alloc.out_of_order:
+            log(f"warm-up {m.target}: {alloc.out_of_order} free range(s) out of order; treating them as allocated")
+        offsets = alloc.offsets()
+        bs = alloc.block_size
+        log(f"warm-up {m.target} via {node}: {alloc.used_blocks * bs / MiB:.0f} MiB allocated of"
+            f" {alloc.block_count * bs / MiB:.0f} MiB -> {len(offsets)} x {chunk // 1024} KiB chunks, {readers} readers")
+        if DRY_RUN:
+            log(f"would read {len(offsets) * chunk / MiB:.0f} MiB from {node}")
+            continue
+        t0 = time.monotonic()
+        n = read_chunks(node, offsets, chunk, readers)
+        dt = time.monotonic() - t0
+        log(f"warm-up {m.target}: read {n / MiB:.0f} MiB in {dt:.1f} s ({n / MiB / dt if dt else 0:.0f} MiB/s)")
+
+
+# ----------------------------------------------------------------------------
 def default_targets() -> List[str]:
     root = "/var/lib/docker"
     try:
@@ -562,7 +827,14 @@ def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--target", action="append", metavar="PATH",
                     help="directory whose storage stack to tune (default: docker data-root)")
-    ap.add_argument("--dry-run", action="store_true", help="detect and report only; write nothing")
+    ap.add_argument("--warm", action="store_true",
+                    help="after tuning, prefetch the allocated blocks of each target filesystem "
+                         "so the remote layer's local cache holds the working set")
+    ap.add_argument("--warm-only", action="store_true", help="warm up without applying tunables")
+    ap.add_argument("--readers", type=int, metavar="N", default=env_int("WARM_READERS", 2),
+                    help="parallel readers for the warm-up (default: $WARM_READERS or 2)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="detect and report only; write nothing, read no data blocks")
     ap.add_argument("--strict", action="store_true", help="exit non-zero if anything failed (default: always 0)")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args(argv)
@@ -578,6 +850,7 @@ def main(argv: List[str]) -> int:
         "VM_DIRTY_BACKGROUND_BYTES": env_int("VM_DIRTY_BACKGROUND_BYTES", 128 * MiB),
         "VM_DIRTY_BYTES": env_int("VM_DIRTY_BYTES", 512 * MiB),
         "VM_VFS_CACHE_PRESSURE": env_int("VM_VFS_CACHE_PRESSURE", 50),
+        "WARM_CHUNK_KB": env_int("WARM_CHUNK_KB", 1024),
     }
     assume_remote = os.environ.get("ASSUME_REMOTE", "") not in ("", "0", "false", "no")
 
@@ -599,7 +872,11 @@ def main(argv: List[str]) -> int:
     if walker.unknown_found:
         log("some layers were not recognised; they are left untouched (see STOP markers above)")
 
-    apply(walker, cfg, assume_remote)
+    remote = decide_remote(walker, assume_remote)
+    if not args.warm_only:
+        apply(walker, cfg, remote)
+    if args.warm or args.warm_only:
+        warm(walker, cfg, remote, args.readers)
 
     if FAILURES:
         log(f"done with {len(FAILURES)} failure(s)")

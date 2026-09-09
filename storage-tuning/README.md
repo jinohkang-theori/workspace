@@ -40,7 +40,7 @@ request was issued and waited on serially. Raising readahead on the FUSE file an
   (the write path drains at ~50 MB/s; the default 20 % of RAM ≈ 1.6 GB of dirty data would stall
   fsync/sync for 30 s+).
 
-## Warm-up (`warm-docker-root.py [readers]`)
+## Warm-up (`warm-docker-root.sh [readers]`)
 
 Parses `dumpe2fs /dev/loop4`, computes the *allocated* block ranges of the inner ext4 (~1.9 GB),
 and reads them through `/dev/loop4` with O_DIRECT in 1 MiB chunks. This pulls exactly the working
@@ -69,7 +69,7 @@ inode-table space that the driver answers from its zero-block manifest without n
 
   ```
   docker -H unix:///var/run/docker-host.sock run --rm --privileged -v /:/host ubuntu \
-    chroot /host bash -c '/home/ubuntu/claude/storage-tuning/apply-tunables.sh && /home/ubuntu/claude/storage-tuning/warm-docker-root.py 2'
+    chroot /host bash -c '/home/ubuntu/claude/storage-tuning/apply-tunables.sh && /home/ubuntu/claude/storage-tuning/warm-docker-root.sh 2'
   ```
 
 ## Analysis helpers

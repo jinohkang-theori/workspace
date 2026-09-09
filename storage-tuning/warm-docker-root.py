@@ -4,6 +4,7 @@ driver's local read cache holds the whole working set. Reads only *allocated*
 inner-fs blocks (~2 GB), not the ~23 GB of stale data still present in dockerlib.
 Idempotent. Run as root on the host. Usage: warm-docker-root.py [parallel-readers]
 """
+import glob
 import mmap
 import os
 import re
@@ -19,16 +20,16 @@ def log(msg):
     print(f"[warm] {msg}", flush=True)
 
 
-def find_loop(pattern):
-    """First loop device whose backing file matches the regex, or None."""
-    out = subprocess.run(
-        ["losetup", "-l", "-n", "-O", "NAME,BACK-FILE"],
-        capture_output=True, text=True, check=True,
-    ).stdout
-    for line in out.splitlines():
-        fields = line.split(None, 1)
-        if len(fields) == 2 and re.search(pattern, fields[1]):
-            return fields[0]
+def find_loop(*globs):
+    """Loop device backing the first existing file among the globs, or None.
+    Matches by device+inode (losetup -j), so a stale "(deleted)" label on the
+    loop's cached path (common on FUSE) does not matter."""
+    for g in globs:
+        for path in sorted(glob.glob(g)):
+            out = subprocess.run(["losetup", "-n", "-O", "NAME", "-j", path],
+                                 capture_output=True, text=True).stdout.split()
+            if out:
+                return out[0]
     return None
 
 
@@ -80,8 +81,8 @@ def read_chunks(dev, offsets):
 
 def main():
     par = int(sys.argv[1]) if len(sys.argv) > 1 else 2
-    inner = find_loop(r"cloudenvdata/dockerlib$")
-    outer = find_loop(r"csfs-fuse")
+    inner = find_loop("/mnt/cloudenvdata/dockerlib")
+    outer = find_loop("/mnt/csfs-fuse/*/disk.img")
     if not inner:
         print("dockerlib loop device not found", file=sys.stderr)
         return 1

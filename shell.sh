@@ -2,10 +2,10 @@
 [ "$#" -gt 0 ] || set -- /bin/bash -i
 
 cmd=
-cmd=$cmd'[ -e /home/ubuntu ] || sudo useradd -u 1000 -g 1000 ubuntu || exit; '
-cmd=$cmd'echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/99-ubuntu; '
-cmd=$cmd'mountpoint -q /home/ubuntu || mount --bind /var/lib/docker/codespacemount/workspace/ubuntu /home/ubuntu; '
-cmd=$cmd'exec systemd-run --quiet --pty --wait --collect --service-type=exec --setenv=TERM="$TERM" --uid=ubuntu --gid=ubuntu --working-directory=/home/ubuntu "$@"'
+#cmd=$cmd'[ -e /home/ubuntu ] || sudo useradd ubuntu || mkdir /home/ubuntu; '
+#cmd=$cmd'echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/99-ubuntu; '
+#cmd=$cmd'mountpoint -q /home/ubuntu || mount --bind /var/lib/docker/codespacemount/workspace/ubuntu /home/ubuntu; '
+cmd=$cmd'exec systemd-run --quiet --pty --wait --collect --service-type=exec --setenv=TERM="$TERM" --uid=cloudenv --gid=cloudenv --working-directory=/home/cloudenv "$@"'
 
 export DOCKER_HOST=unix:///var/run/docker-host.sock
 

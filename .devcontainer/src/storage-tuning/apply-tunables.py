@@ -15,8 +15,8 @@ left alone; the walk stops there ("apply as much as possible, guess nothing").
 
 This runs on the devcontainer critical path. It therefore never exits non-zero
 unless --strict is given: every failure is logged and skipped. None of the knobs
-touched here (readahead, FUSE queue depth, noatime, dirty-page limits) can
-corrupt data, so there is no situation in which aborting is safer than
+touched here (readahead, loop direct I/O, FUSE queue depth, noatime, dirty-page
+limits) can corrupt data, so there is no situation in which aborting is safer than
 continuing.
 
 With --warm it additionally prefetches the target filesystem's *allocated* blocks
@@ -37,6 +37,26 @@ Environment overrides (KiB unless noted):
   MID_RA    (alias LOOP3_RA, default 4096) readahead of intermediate virtual block
                                             devices and remote block devices, applied
                                             only when a remote layer is detected below.
+                                            Note: a file's readahead window is copied
+                                            from the bdi when the file is opened, so this
+                                            (and REMOTE_RA) only reaches files opened
+                                            afterwards, not the backing file a loop
+                                            device already holds open.
+  MID_DIO   (alias LOOP3_DIO, default 1)   direct I/O (LOOP_SET_DIRECT_IO) on intermediate
+                                            loop devices when a remote layer is below. The
+                                            loop then reads/writes its backing file with
+                                            O_DIRECT: one page-cache copy of the data
+                                            less, and writes leave as the loop's requests
+                                            (128 KiB+) instead of 4 KiB page writeback
+                                            (measured 4x-7x faster write+fsync, no read
+                                            regression: the inner loop's cache still
+                                            serves hits). Set 0 to leave buffered.
+  INNER_DIO (alias LOOP4_DIO, default 0)   same for the loop device directly under the
+                                            docker root. Off: it would remove the last
+                                            kernel page-cache copy below the docker root,
+                                            and every inner miss would then pay a FUSE
+                                            round trip (measured 6x slower small-file
+                                            reads).
   REMOTE_RA (alias FUSE_RA,  default 4096) readahead on FUSE / network filesystems.
   FUSE_MAX_BACKGROUND (64), FUSE_CONGESTION_THRESHOLD (48)
   VM_DIRTY_BACKGROUND_BYTES (128 MiB), VM_DIRTY_BYTES (512 MiB), VM_VFS_CACHE_PRESSURE (50)
@@ -46,6 +66,7 @@ Environment overrides (KiB unless noted):
                    recognised (enables MID_RA, the vm.* limits and --warm).
 """
 import argparse
+import fcntl
 import json
 import mmap
 import os
@@ -494,6 +515,53 @@ def set_readahead(b: BlockDev, kb: int, what: str) -> None:
     write_knob(os.path.join(q, "read_ahead_kb"), kb, what)
 
 
+LOOP_SET_DIRECT_IO = 0x4C08
+
+
+def set_loop_dio(b: BlockDev, on: int, what: str) -> None:
+    """Switch a loop device between buffered and direct I/O on its backing file.
+
+    Safe at run time: the kernel fsyncs the backing file and freezes the queue while
+    switching. The kernel refuses (EINVAL) when the backing file does not support
+    O_DIRECT or the loop offset is not aligned to the backing device's block size; that
+    is logged and skipped.
+    """
+    on = 1 if on else 0
+    sysfs = os.path.join(b.syspath, "loop", "dio")
+    cur = _read(sysfs)
+    if cur is None:
+        log(f"skip {what}: {sysfs} not readable")
+        return
+    if cur == str(on):
+        dbg(f"{what}: already {'on' if on else 'off'}")
+        return
+    if DRY_RUN:
+        log(f"would set {what}: {sysfs} {cur} -> {on}")
+        return
+    node = b.devnode
+    if node is None:
+        fail(f"{what}: no device node for /dev/{b.name}")
+        return
+    try:
+        fd = os.open(node, os.O_RDWR | os.O_CLOEXEC)
+    except OSError as e:
+        fail(f"{what}: open {node} ({e.strerror})")
+        return
+    try:
+        fcntl.ioctl(fd, LOOP_SET_DIRECT_IO, on)
+    except OSError as e:
+        hint = " (backing file does not support O_DIRECT or offset misaligned)" if e.errno == 22 else ""
+        fail(f"{what}: LOOP_SET_DIRECT_IO {on} on {node} ({e.strerror}){hint}")
+        return
+    finally:
+        os.close(fd)
+    now = _read(sysfs)
+    if now == str(on):
+        log(f"{what}: {sysfs} {cur} -> {now}")
+    else:
+        fail(f"{what}: ioctl succeeded but {sysfs} reads {now!r}, expected {on}")
+
+
 def tune_remote_fs(m: Mount, cfg: Dict[str, int]) -> None:
     bdi = f"{SYS}/class/bdi/{m.majmin}/read_ahead_kb"
     write_knob(bdi, cfg["REMOTE_RA"], f"readahead {m.fstype} {m.target}")
@@ -570,13 +638,17 @@ def apply(walker: Walker, cfg: Dict[str, int], remote: bool) -> None:
             if b.majmin in inner_blks:
                 if b.is_virtual:
                     set_readahead(b, cfg["INNER_RA"], f"readahead inner /dev/{b.name}")
+                    if b.kind == "loop":
+                        set_loop_dio(b, cfg["INNER_DIO"], f"direct-io inner /dev/{b.name}")
                 else:
                     log(f"leave readahead of inner /dev/{b.name} ({b.kind}) at default")
             elif b.is_virtual or b.kind == "disk-remote":
                 if remote:
                     set_readahead(b, cfg["MID_RA"], f"readahead {b.kind} /dev/{b.name}")
+                    if b.kind == "loop":
+                        set_loop_dio(b, cfg["MID_DIO"], f"direct-io {b.kind} /dev/{b.name}")
                 else:
-                    log(f"leave readahead of /dev/{b.name} ({b.kind}) at default: stack not known to be remote")
+                    log(f"leave readahead and direct-io of /dev/{b.name} ({b.kind}) at default: stack not known to be remote")
             # partitions, local disks, unknown: untouched
 
     if remote:
@@ -844,6 +916,8 @@ def main(argv: List[str]) -> int:
     cfg = {
         "INNER_RA": env_int("INNER_RA", 128, "LOOP4_RA"),
         "MID_RA": env_int("MID_RA", 4096, "LOOP3_RA"),
+        "INNER_DIO": env_int("INNER_DIO", 0, "LOOP4_DIO"),
+        "MID_DIO": env_int("MID_DIO", 1, "LOOP3_DIO"),
         "REMOTE_RA": env_int("REMOTE_RA", 4096, "FUSE_RA"),
         "FUSE_MAX_BACKGROUND": env_int("FUSE_MAX_BACKGROUND", 64),
         "FUSE_CONGESTION_THRESHOLD": env_int("FUSE_CONGESTION_THRESHOLD", 48),

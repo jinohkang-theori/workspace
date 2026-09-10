@@ -3,9 +3,10 @@
 Tunes the storage stack that sits under the docker root of a GitHub Codespaces VM host
 (Azure Blob → FUSE driver → loop → ext4 → loop → ext4 `/var/lib/docker`) and optionally
 prefetches the docker root's *allocated* blocks into the host's local read cache. Measured on the
-default Codespaces stack: cold sequential reads through the docker root go from 15–38 MB/s to
-~140 MB/s; a full prewarm of the ~2 GB working set takes 12–19 s. The reasoning and the
-measurements are in [`storage-tuning/README.md`](../../../storage-tuning/README.md).
+default Codespaces stack: write + fsync through the docker root goes from ~47 MB/s to 176–350 MB/s
+and one of the three kernel page-cache copies of every hot block disappears (loop direct I/O on the
+intermediate loop device); a full prewarm of the ~2 GB working set takes 12–19 s. The reasoning and
+the measurements are in [`storage-tuning/README.md`](../../../storage-tuning/README.md).
 
 The Feature bundles [`apply-tunables.py`](apply-tunables.py) and a wrapper that runs it **on the
 host** at every container start (`postStartCommand`), because nothing on the host survives a
@@ -39,7 +40,7 @@ Because of that reach, the Feature does nothing unless you opt in with two
 
 | Secret | Effect |
 |---|---|
-| `ENABLE_STORAGE_TUNING` | apply the tunables (readahead, FUSE queue depth, `noatime`, `vm.dirty_*`, `vm.vfs_cache_pressure`) |
+| `ENABLE_STORAGE_TUNING` | apply the tunables (loop direct I/O, readahead, FUSE queue depth, `noatime`, `vm.dirty_*`, `vm.vfs_cache_pressure`) |
 | `ENABLE_STORAGE_PREWARM` | prefetch the docker root's allocated blocks into the host's local cache |
 
 Any value other than empty, `0`, `false`, `no`, `off` or `disabled` enables. Set either or both;
@@ -93,7 +94,7 @@ storage-tuning                              # honours the environment, as postSt
 
 Anything else on the command line (`--dry-run`, `--verbose`, `--strict`, `--readers N`,
 `--target PATH`) is passed to `apply-tunables.py`. Its tuning knobs (`INNER_RA`, `MID_RA`,
-`REMOTE_RA`, `FUSE_MAX_BACKGROUND`, `FUSE_CONGESTION_THRESHOLD`, `VM_DIRTY_BACKGROUND_BYTES`,
+`INNER_DIO`, `MID_DIO`, `REMOTE_RA`, `FUSE_MAX_BACKGROUND`, `FUSE_CONGESTION_THRESHOLD`, `VM_DIRTY_BACKGROUND_BYTES`,
 `VM_DIRTY_BYTES`, `VM_VFS_CACHE_PRESSURE`, `WARM_READERS`, `WARM_CHUNK_KB`, `ASSUME_REMOTE`) are
 forwarded from the container environment when set, so they can be secrets or `remoteEnv` too.
 

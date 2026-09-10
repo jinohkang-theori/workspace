@@ -2,7 +2,7 @@
     "id": "storage-tuning",
     "version": "1.0.0",
     "name": "Codespaces host storage tuning",
-    "description": "Tunes the network-backed storage stack under the docker root of the Codespaces VM host (readahead, FUSE queue depth, noatime, dirty-page limits) and optionally prefetches the working set into the host's local cache. Runs on the host through the host's docker socket (bind-mounted by this Feature; no docker CLI needed, compatible with docker-in-docker) at every container start. Disabled unless the ENABLE_STORAGE_TUNING / ENABLE_STORAGE_PREWARM secrets are set.",
+    "description": "Tunes the network-backed storage stack under the docker root of the Codespaces VM host (loop direct I/O, readahead, FUSE queue depth, noatime, dirty-page limits) and optionally prefetches the working set into the host's local cache. Runs on the host through the host's docker socket (bind-mounted by this Feature; no docker CLI needed, compatible with docker-in-docker) at every container start. Disabled unless the ENABLE_STORAGE_TUNING / ENABLE_STORAGE_PREWARM secrets are set.",
     "documentationURL": "https://github.com/jinohkang-theori/workspace/tree/main/.devcontainer/src/storage-tuning",
     "licenseURL": "https://github.com/jinohkang-theori/workspace",
     "keywords": [

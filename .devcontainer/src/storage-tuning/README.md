@@ -13,15 +13,25 @@ codespace stop/start.
 
 ## This touches the VM host: it is off by default
 
-The host is reached through the docker socket that
+The host is reached through its docker socket. The Feature bind-mounts the host's
+`/var/run/docker.sock` at `/var/run/docker-host.sock` itself (declared in
+`devcontainer-feature.json`, the same mount
 [docker-outside-of-docker](https://github.com/devcontainers/features/tree/main/src/docker-outside-of-docker)
-mounts (a hard dependency of this Feature). A throw-away `--privileged --pid=host --userns=host`
-helper container is started from this dev container's own image and `nsenter -t 1 -m -u -i -n -p`
-moves into PID 1's namespaces; the script is streamed over stdin to the host's `python3`, so nothing
-is written onto the host. It is deliberately **not** `chroot /host`: a chroot keeps the container's
-mount and user namespaces, and the remounts, `/proc/sys/vm` writes, FUSE connection files and loop
-backing-file lookups all resolve against the *current* namespaces. After the switch the wrapper
-checks that its `mnt`, `user` and `pid` namespaces are PID 1's and refuses to continue otherwise.
+makes) and talks to the daemon over the Docker Engine API with the bundled
+[`run-on-host.py`](run-on-host.py), Python standard library only. No docker CLI is installed and
+`/var/run/docker.sock` is not touched, so the Feature coexists with
+[docker-in-docker](https://github.com/devcontainers/features/tree/main/src/docker-in-docker), which
+owns that path (docker-outside-of-docker, by contrast, symlinks it to the host socket).
+
+`run-on-host.py` creates a throw-away `--privileged --pid=host --userns=host` helper container from
+this dev container's own image and runs `nsenter -t 1 -m -u -i -n -p` in it to move into PID 1's
+namespaces; the script is streamed over stdin to the host's `python3`, so nothing is written onto the
+host. It is deliberately **not** `chroot /host`: a chroot keeps the container's mount and user
+namespaces, and the remounts, `/proc/sys/vm` writes, FUSE connection files and loop backing-file
+lookups all resolve against the *current* namespaces. After the switch the wrapper checks that its
+`mnt`, `user` and `pid` namespaces are PID 1's and refuses to continue otherwise. If the socket is not
+writable by the container user (it is `root:docker` on the host), `run-on-host.py` re-executes itself
+through passwordless `sudo`, which common-utils sets up for the remote user.
 
 Because of that reach, the Feature does nothing unless you opt in with two
 [Codespaces user secrets](https://docs.github.com/en/codespaces/managing-your-codespaces/managing-your-account-specific-secrets-for-github-codespaces)
@@ -63,8 +73,9 @@ intermediate readahead and `vm.*` limits at their defaults and skips the prewarm
 }
 ```
 
-`docker-outside-of-docker` is pulled in automatically through `dependsOn`; listing it yourself
-(with the same `:1` tag and no options) is fine and does not install it twice.
+No other Feature is required. Adding `docker-outside-of-docker` for its docker CLI is fine (both
+declare the same mount target and the devcontainer CLI deduplicates mounts), and so is
+`docker-in-docker`.
 
 From a terminal inside the container:
 
@@ -85,7 +96,7 @@ forwarded from the container environment when set, so they can be secrets or `re
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `dockerSocket` | string | `/var/run/docker-host.sock` | Where the host's docker socket is mounted inside the container. Match docker-outside-of-docker's `socketPath` if you changed it. |
+| `dockerSocket` | string | `/var/run/docker-host.sock` | Where the host's docker socket is inside the container. The Feature always mounts it at the default; change this only if your configuration already mounts the host socket elsewhere. |
 | `helperImage` | string | `""` | Image for the privileged helper container (needs only `nsenter`). Empty reuses this dev container's own image, so no pull happens. |
 | `warmReaders` | string | `"2"` | Parallel O_DIRECT readers for the prewarm. |
 | `timeoutSeconds` | string | `"900"` | Kill the host-side run after this long; `0` disables. Interrupting it is harmless. |
@@ -98,9 +109,11 @@ at run time.
 
 ## Requirements
 
-- A dev container that can see the host's docker socket (Codespaces, or a local Docker host).
-  Docker-in-docker is not the same thing: there PID 1 is the dev container's init, which the wrapper
-  warns about.
+- A host whose `/var/run/docker.sock` can be bind-mounted into the dev container (Codespaces, or a
+  local Docker host). Pointing `dockerSocket` at a docker-in-docker daemon is not the same thing:
+  there PID 1 is the dev container's init, which the wrapper warns about.
+- `python3` in the **container** for `run-on-host.py` (installed with `apt-get` if missing on
+  Debian/Ubuntu images). The remote user must be able to open the socket, or have passwordless `sudo`.
 - `python3` and `dumpe2fs` (e2fsprogs) on the **host**; both are present on Codespaces hosts. The
   prewarm is skipped without `dumpe2fs`, the whole run without `python3`.
 - The helper image must have `nsenter` (util-linux or busybox). Every `mcr.microsoft.com/devcontainers`
@@ -111,5 +124,6 @@ at run time.
 ```
 /usr/local/share/storage-tuning/storage-tuning     wrapper (postStartCommand), also /usr/local/bin/storage-tuning
 /usr/local/share/storage-tuning/apply-tunables.py  streamed to the host's python3
+/usr/local/share/storage-tuning/run-on-host.py     Docker Engine API client: privileged helper + nsenter into PID 1
 /usr/local/share/storage-tuning/config.env         defaults generated from the Feature options
 ```

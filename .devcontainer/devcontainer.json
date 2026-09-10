@@ -7,6 +7,8 @@
 
 	// Features to add to the dev container. More info: https://containers.dev/features.
 	"features": {
+		// docker CLI for shell.sh and friends. Not needed by storage-tuning, which mounts the
+		// host socket at /var/run/docker-host.sock itself (same target; mounts are deduplicated).
 		"ghcr.io/devcontainers/features/docker-outside-of-docker:1": {},
 		// Host storage tuning (local copy of the Feature in ./src/storage-tuning; published
 		// as ghcr.io/jinohkang-theori/workspace/storage-tuning by .github/workflows/release.yaml).

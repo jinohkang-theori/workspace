@@ -36,6 +36,7 @@ case "$VERBOSE" in true|false) ;; *) echo "storage-tuning: option verbose must b
 
 mkdir -p "$DEST"
 install -m 0755 "$SRC/apply-tunables.py" "$DEST/apply-tunables.py"
+install -m 0755 "$SRC/run-on-host.py" "$DEST/run-on-host.py"
 install -m 0755 "$SRC/storage-tuning.sh" "$DEST/storage-tuning"
 ln -sf "$DEST/storage-tuning" /usr/local/bin/storage-tuning
 
@@ -50,7 +51,21 @@ cat > "$DEST/config.env" <<EOF
 EOF
 chmod 0644 "$DEST/config.env"
 
-# The wrapper only needs a POSIX sh, grep, sed, readlink and the docker CLI
-# (provided by the docker-outside-of-docker Feature this one depends on).
+# The wrapper needs a POSIX sh and python3: run-on-host.py speaks the Docker
+# Engine API over the bind-mounted host socket itself, so no docker CLI (and no
+# docker-outside-of-docker Feature) is required. Debian/Ubuntu images without
+# python3 get it installed here; elsewhere the wrapper logs and exits 0 at run time.
+if ! command -v python3 >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "storage-tuning: python3 not found; installing it"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y
+        apt-get install -y --no-install-recommends python3
+        rm -rf /var/lib/apt/lists/*
+    else
+        echo "storage-tuning: warning: python3 not found and no apt-get; the postStart hook will be a no-op" >&2
+    fi
+fi
+
 echo "storage-tuning: installed to $DEST (docker socket $DOCKERSOCKET, warm readers $WARMREADERS, timeout ${TIMEOUTSECONDS}s)"
 echo "storage-tuning: opt in with the ENABLE_STORAGE_TUNING / ENABLE_STORAGE_PREWARM secrets"

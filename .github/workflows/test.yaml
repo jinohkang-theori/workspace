@@ -20,6 +20,8 @@ jobs:
       - name: python and json
         run: |
           python3 -m py_compile .devcontainer/src/storage-tuning/apply-tunables.py
+          python3 -m py_compile .devcontainer/src/storage-tuning/run-on-host.py
+          python3 -m py_compile .devcontainer/test/storage-tuning/fake-dockerd.py
           python3 -m json.tool .devcontainer/src/storage-tuning/devcontainer-feature.json >/dev/null
           python3 -m json.tool .devcontainer/test/storage-tuning/scenarios.json >/dev/null
 

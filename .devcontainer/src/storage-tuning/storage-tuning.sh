@@ -13,9 +13,12 @@
 # variables. Any value other than "", 0, false, no, off or disabled enables.
 # `--tune` / `--prewarm` do the same from the command line.
 #
-# How the host is reached: a throw-away privileged helper container is started
-# through the host docker socket (mounted by docker-outside-of-docker) with
-# --pid=host --userns=host, and `nsenter -t 1 -m -u -i -n -p` moves into PID 1's
+# How the host is reached: run-on-host.py talks to the host docker daemon over
+# the Docker Engine API on the bind-mounted host socket (the Feature mounts
+# /var/run/docker.sock at /var/run/docker-host.sock; no docker CLI is involved
+# and /var/run/docker.sock is left alone, so docker-in-docker keeps working).
+# It starts a throw-away privileged helper container with --pid=host
+# --userns=host, and `nsenter -t 1 -m -u -i -n -p` moves into PID 1's
 # namespaces. This is deliberately NOT `chroot /host`: a chroot keeps the
 # container's mount and user namespace, and several of the knobs this touches
 # (remount, /proc/sys/vm, FUSE connection files, mountinfo of loop backing
@@ -31,6 +34,7 @@ set -u
 TAG="[storage-tuning]"
 SHARE="${STORAGE_TUNING_SHARE:-/usr/local/share/storage-tuning}"
 SCRIPT="$SHARE/apply-tunables.py"
+RUNNER="$SHARE/run-on-host.py"
 
 log() { printf '%s %s\n' "$TAG" "$*"; }
 
@@ -106,46 +110,16 @@ case " $* " in
 esac
 
 [ -r "$SCRIPT" ] || fail_soft "$SCRIPT is missing; the Feature was not installed correctly"
-command -v docker >/dev/null 2>&1 || fail_soft "docker CLI not found; the docker-outside-of-docker Feature is required"
+[ -r "$RUNNER" ] || fail_soft "$RUNNER is missing; the Feature was not installed correctly"
+command -v python3 >/dev/null 2>&1 || fail_soft "python3 not found in the container; it is needed to talk to the docker socket"
 
 sock=$STORAGE_TUNING_DOCKER_SOCKET
-[ -S "$sock" ] || fail_soft "host docker socket $sock is not present; is the docker-outside-of-docker mount in place?"
-
-# Pick a way to talk to the *host* daemon. Order: the raw host socket directly,
-# the same via sudo, then the socat proxy docker-outside-of-docker sets up for
-# the non-root user (it forwards to the same host socket).
-DOCKER=
-for cand in "docker -H unix://$sock" "sudo -n docker -H unix://$sock" "docker"; do
-    case "$cand" in
-        sudo*) command -v sudo >/dev/null 2>&1 || continue ;;
-        docker) if ! { [ -S /var/run/docker.sock ] && [ "$sock" != /var/run/docker.sock ]; }; then continue; fi ;;
-    esac
-    if $cand version --format '{{.Server.Version}}' >/dev/null 2>&1; then
-        DOCKER=$cand
-        break
-    fi
-done
-[ -n "$DOCKER" ] || fail_soft "cannot reach the docker daemon through $sock (tried directly, via sudo and via /var/run/docker.sock)"
+[ -S "$sock" ] || fail_soft "host docker socket $sock is not present; is the bind mount of /var/run/docker.sock in place?"
 
 # The helper only needs `nsenter`; everything else runs from the host's own root
-# filesystem. Reuse this dev container's image so no pull is needed.
-self_id() {
-    id=$(grep -o -E '/(docker|containers)/[0-9a-f]{64}' /proc/self/mountinfo /proc/self/cgroup 2>/dev/null \
-        | grep -o -m1 -E '[0-9a-f]{64}')
-    [ -n "$id" ] && { echo "$id"; return; }
-    hostname
-}
+# filesystem. run-on-host.py reuses this dev container's image unless
+# STORAGE_TUNING_HELPER_IMAGE names another, so no pull is needed.
 image=$STORAGE_TUNING_HELPER_IMAGE
-if [ -z "$image" ]; then
-    image=$($DOCKER inspect --format '{{.Image}}' "$(self_id)" 2>/dev/null | sed 's/^sha256://')
-fi
-if [ -z "$image" ]; then
-    image=$($DOCKER ps --filter "volume=$sock" --format '{{.Image}}' 2>/dev/null | head -n 1)
-fi
-if [ -z "$image" ]; then
-    image=docker.io/library/busybox:stable
-    log "could not identify this container's image; falling back to $image (may need a pull)"
-fi
 
 # Forward the tuning knobs apply-tunables.py understands, if set here.
 envs=""
@@ -186,35 +160,18 @@ fi
 exec python3 - "$@"
 '
 
-name="storage-tuning-$$"
-log "running apply-tunables.py $* on the docker host (helper image $image, via ${DOCKER%% *})"
+log "running apply-tunables.py $* on the docker host (helper image ${image:-<own image>}, via $sock)"
 
-# A watchdog instead of coreutils `timeout`: killing the helper container also
-# kills the nsenter'ed host processes (they stay in the helper's cgroup).
-watchdog=
-if [ "$STORAGE_TUNING_TIMEOUT" -gt 0 ] 2>/dev/null; then
-    (
-        sleep "$STORAGE_TUNING_TIMEOUT"
-        if $DOCKER kill "$name" >/dev/null 2>&1; then
-            log "timed out after ${STORAGE_TUNING_TIMEOUT}s; helper container killed"
-        fi
-    ) &
-    watchdog=$!
-fi
-
+# run-on-host.py reads the daemon's answers itself, kills the helper container
+# after STORAGE_TUNING_TIMEOUT seconds (killing it also kills the nsenter'ed
+# host processes, which stay in the helper's cgroup) and falls back to sudo if
+# the socket is not writable by this user.
 # shellcheck disable=SC2086
-$DOCKER run --rm -i --name "$name" \
-    --privileged --pid=host --userns=host --uts=host --ipc=host --cgroupns=host --network=host \
-    --entrypoint nsenter "$image" \
-    -t 1 -m -u -i -n -p -- \
+python3 "$RUNNER" --socket "$sock" --image "$image" --name "storage-tuning-$$" \
+    --timeout "$STORAGE_TUNING_TIMEOUT" --stdin "$SCRIPT" -- \
     env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin $envs \
-    sh -c "$host_cmd" storage-tuning "$@" < "$SCRIPT"
+    sh -c "$host_cmd" storage-tuning "$@"
 rc=$?
-
-if [ -n "$watchdog" ]; then
-    kill "$watchdog" 2>/dev/null
-    wait "$watchdog" 2>/dev/null
-fi
 
 if [ "$rc" -ne 0 ]; then
     log "helper exited with status $rc"

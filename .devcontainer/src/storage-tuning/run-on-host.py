@@ -15,10 +15,12 @@ compatible with docker-in-docker.
 A throw-away privileged helper container is created from IMAGE (default: this dev
 container's own image, so nothing is pulled), `nsenter -t 1 -m -u -i -n -p` moves into
 PID 1's namespaces and CMD runs there. stdout/stderr are streamed back; stdin can be
-fed from a file (--stdin FILE) or forwarded (-i). The exit status is CMD's.
+fed from a file (--stdin FILE) or forwarded (-i). With -t the helper gets a pseudo-TTY
+and the local terminal is put into raw mode, so `run-on-host.py -it -- bash` is a
+root shell on the host. The exit status is CMD's.
 
 Usage: run-on-host.py [--socket PATH] [--image IMAGE] [--name NAME] [--timeout SECONDS]
-                      [--stdin FILE | -i] [--verbose] -- CMD [ARGS...]
+                      [--stdin FILE | -i] [-t] [--verbose] -- CMD [ARGS...]
 
 If the socket is not accessible to the current user and passwordless sudo is available,
 the script re-executes itself through sudo. Exit status 125 means this script (or the
@@ -35,7 +37,9 @@ import socket
 import stat
 import subprocess
 import sys
+import termios
 import threading
+import tty
 from typing import Any, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -221,16 +225,18 @@ def reexec_with_sudo(argv: List[str]) -> None:
     os.execvp("sudo", ["sudo", "-n", "--", sys.executable, os.path.abspath(__file__)] + argv)
 
 
-def feed_stdin(sock: socket.socket, src) -> None:
-    """Copy src into the hijacked connection, then half-close it so the daemon closes the
-    container's stdin (StdinOnce). Runs in a thread."""
+def feed_stdin(sock: socket.socket, fd: int) -> None:
+    """Copy file descriptor fd into the hijacked connection, then half-close it so the
+    daemon closes the container's stdin (StdinOnce). Runs in a daemon thread, so it must
+    use raw os.read: a blocked read on the buffered sys.stdin would hold that object's
+    lock at interpreter shutdown and abort the process."""
     try:
         while True:
-            data = src.read(65536)
+            data = os.read(fd, 65536)
             if not data:
                 break
             sock.sendall(data)
-    except (OSError, ValueError) as e:
+    except OSError as e:
         debug(f"stdin copy stopped: {e}")
     finally:
         try:
@@ -239,10 +245,21 @@ def feed_stdin(sock: socket.socket, src) -> None:
             pass
 
 
-def pump_output(sock: socket.socket, initial: bytes) -> None:
-    """Demultiplex the docker stream (8-byte frame header: type, 3 pad, u32 BE length)
-    onto our stdout/stderr until the daemon closes the connection."""
+def pump_output(sock: socket.socket, initial: bytes, raw: bool) -> None:
+    """Copy the attach stream to our stdout/stderr until the daemon closes the connection.
+    With a TTY the stream is raw; otherwise it is multiplexed in frames (8-byte header:
+    type, 3 pad, u32 BE length) that are split onto stdout and stderr."""
     outs = {1: sys.stdout.buffer, 2: sys.stderr.buffer}
+    if raw:
+        if initial:
+            sys.stdout.buffer.write(initial)
+            sys.stdout.buffer.flush()
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                return
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
     buf = bytearray(initial)
     while True:
         while len(buf) >= 8:
@@ -281,6 +298,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--stdin", metavar="FILE", help="feed FILE to CMD's stdin")
     g.add_argument("-i", "--interactive", action="store_true", help="forward our stdin to CMD")
+    p.add_argument("-t", "--tty", action="store_true",
+                   help="give CMD a pseudo-TTY (raw mode on our terminal, resize forwarded); combine with -i for a shell")
     p.add_argument("--verbose", action="store_true", help="log every API call")
     p.add_argument("cmd", nargs=argparse.REMAINDER, metavar="-- CMD [ARGS...]")
     args = p.parse_args(argv)
@@ -312,16 +331,25 @@ def main(argv: List[str]) -> int:
         log(f"cannot use {args.socket}: {e}")
         return EXIT_INTERNAL
 
-    stdin_src = None
+    stdin_file = None
+    stdin_fd = None
     if args.stdin:
         try:
-            stdin_src = open(args.stdin, "rb")
+            stdin_file = open(args.stdin, "rb")
         except OSError as e:
             log(f"cannot read {args.stdin}: {e}")
             return EXIT_INTERNAL
+        stdin_fd = stdin_file.fileno()
     elif args.interactive:
-        stdin_src = sys.stdin.buffer
-    with_stdin = stdin_src is not None
+        stdin_fd = sys.stdin.fileno()
+    with_stdin = stdin_fd is not None
+    use_tty = args.tty
+    local_tty = use_tty and sys.stdin.isatty()
+    if use_tty and with_stdin and not (args.interactive and local_tty):
+        # In TTY mode the daemon closes stdout/stderr as soon as stdin hits EOF, so a
+        # pipe or file on stdin would truncate the output. Same rule as `docker run -t`.
+        log("the input device is not a TTY; use -t only with -i on a terminal (or without stdin)")
+        return EXIT_INTERNAL
 
     api = Docker(args.socket)
     try:
@@ -337,7 +365,7 @@ def main(argv: List[str]) -> int:
         "Image": image,
         "Entrypoint": ["nsenter"],
         "Cmd": NSENTER_ARGS + args.cmd,
-        "Tty": False,
+        "Tty": use_tty,
         "OpenStdin": with_stdin,
         "StdinOnce": with_stdin,
         "AttachStdin": with_stdin,
@@ -358,8 +386,18 @@ def main(argv: List[str]) -> int:
     cid = None
     stream = None
     timer = None
+    saved_termios = None
     timed_out = threading.Event()
     rc = EXIT_INTERNAL
+
+    def resize() -> None:
+        try:
+            size = os.get_terminal_size(sys.stdin.fileno())
+            if size.lines <= 0 or size.columns <= 0:
+                return  # no real size to forward (e.g. a fresh pty); the daemon rejects 0x0 anyway
+            api.request("POST", f"/containers/{cid}/resize?h={size.lines}&w={size.columns}", ok=(200, 204))
+        except (OSError, ApiError) as e:
+            debug(f"resize: {e}")
 
     def kill(reason: str) -> None:
         if cid is None:
@@ -388,6 +426,12 @@ def main(argv: List[str]) -> int:
         # Attach before starting so no early output is lost (as the docker CLI does).
         stream, initial = api.attach(cid, with_stdin)
         api.request("POST", f"/containers/{cid}/start")
+        if local_tty:
+            # Raw mode: keystrokes (including ^C) go to the host command, not to us.
+            saved_termios = termios.tcgetattr(sys.stdin.fileno())
+            tty.setraw(sys.stdin.fileno())
+            resize()
+            signal.signal(signal.SIGWINCH, lambda *_: resize())
 
         if args.timeout and args.timeout > 0:
             def fire():
@@ -397,14 +441,12 @@ def main(argv: List[str]) -> int:
             timer.daemon = True
             timer.start()
 
-        feeder = None
         if with_stdin:
-            feeder = threading.Thread(target=feed_stdin, args=(stream, stdin_src), daemon=True)
-            feeder.start()
+            # Daemon thread: when the container exits it may still be blocked reading a
+            # terminal, and there is nothing left to feed anyway.
+            threading.Thread(target=feed_stdin, args=(stream, stdin_fd), daemon=True).start()
 
-        pump_output(stream, initial)
-        if feeder is not None:
-            feeder.join(timeout=5)
+        pump_output(stream, initial, raw=use_tty)
 
         result = api.request("POST", f"/containers/{cid}/wait")
         rc = int(result.get("StatusCode", EXIT_INTERNAL))
@@ -423,6 +465,8 @@ def main(argv: List[str]) -> int:
         kill(f"interrupted ({e.code})")
         raise
     finally:
+        if saved_termios is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved_termios)
         if timer is not None:
             timer.cancel()
         if stream is not None:
@@ -430,8 +474,8 @@ def main(argv: List[str]) -> int:
                 stream.close()
             except OSError:
                 pass
-        if stdin_src is not None and stdin_src is not sys.stdin.buffer:
-            stdin_src.close()
+        if stdin_file is not None:
+            stdin_file.close()
         if cid is not None:
             try:
                 api.request("DELETE", f"/containers/{cid}?v=1&force=1", ok=(204, 404))

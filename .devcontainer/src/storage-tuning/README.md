@@ -84,7 +84,12 @@ storage-tuning --tune --prewarm --dry-run   # show the detected stack and planne
 storage-tuning --tune                       # same as ENABLE_STORAGE_TUNING=1
 storage-tuning --prewarm                    # same as ENABLE_STORAGE_PREWARM=1
 storage-tuning                              # honours the environment, as postStart does
+/usr/local/share/storage-tuning/run-on-host.py -it -- bash   # a root shell on the VM host
 ```
+
+`run-on-host.py` is the general mechanism the wrapper uses: `run-on-host.py [-i] [-t] [--stdin FILE]
+[--timeout SECONDS] -- CMD...` runs `CMD` in PID 1's namespaces on the host, with stdin forwarded
+(`-i`), a pseudo-TTY (`-t`, on a terminal) or a file on stdin, and returns `CMD`'s exit status.
 
 Anything else on the command line (`--dry-run`, `--verbose`, `--strict`, `--readers N`,
 `--target PATH`) is passed to `apply-tunables.py`. Its tuning knobs (`INNER_RA`, `MID_RA`,
